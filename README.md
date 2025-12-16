@@ -1,2 +1,2 @@
 # afm-morphology-transfer-learning
-Transfer learning and feature extraction on AFM images of cells  Public (recommended for now)
+Simple AFM autoencoder that will be used for Transfer learning and feature extraction on AFM images.
