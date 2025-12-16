@@ -1,15 +1,18 @@
-""" 
+"""
 Process gwyddion files in a given folder
 does background substraction, row alignment, clips outliers and saves to .h5 file
 This version works when you want to merge topogrpahy and phase/friction
 python preprocess/process_gwy_multichannel.py --input_dir data/data_gwy/ --topo_channel_title Topography --aux_channel_title Topography --stride 128 --out_h5 afm_patches_256.h5
+
+By default channel 1 (phase/friction) is normalized per image; use
+--normalize_channels to customize or disable that behavior.
 """
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -194,6 +197,30 @@ def preprocess_pair_raw_and_proc(
     return raw, proc
 
 
+def normalize_channel_stack(
+    stack: np.ndarray,
+    channels: Sequence[int],
+    eps: float = 1e-6,
+) -> None:
+    """
+    Normalize selected channels of a (C,H,W) stack in-place: (x - mean) / std.
+    Channels outside range are ignored.
+    """
+    if not channels:
+        return
+    c_total = stack.shape[0]
+    for ch in channels:
+        if ch < 0 or ch >= c_total:
+            continue
+        plane = stack[ch]
+        mean = float(np.mean(plane))
+        std = float(np.std(plane))
+        if not np.isfinite(std) or std < eps:
+            stack[ch] = plane - mean
+        else:
+            stack[ch] = (plane - mean) / max(std, eps)
+
+
 # ---------- Pairing files ----------
 
 AUX_SUFFIXES = [
@@ -326,6 +353,7 @@ def build_h5_from_folder(
     topo_channel_title: Optional[str] = None,
     aux_channel_title: Optional[str] = None,
     max_pairs: int | None = None,
+    normalize_channels: Optional[Sequence[int]] = None,
 ):
     """
     Finds topo+aux .gwy pairs in input_dir (based on filename suffix),
@@ -350,6 +378,21 @@ def build_h5_from_folder(
         )
 
     out_h5.parent.mkdir(parents=True, exist_ok=True)
+
+    if normalize_channels is None:
+        norm_channels: Tuple[int, ...] = (1,)
+    else:
+        # remove duplicates but keep order
+        seen = []
+        for ch in normalize_channels:
+            if ch not in seen:
+                seen.append(int(ch))
+        norm_channels = tuple(seen)
+
+    if norm_channels:
+        print(f"Per-image normalization enabled for channels: {norm_channels}")
+    else:
+        print("Per-image normalization disabled.")
 
     with h5py.File(out_h5, "w") as f:
         # Resizable datasets for patches (2 channels)
@@ -442,6 +485,8 @@ def build_h5_from_folder(
                 "plane": True,
                 "row_median": True,
                 "clip_sigma": clip_sigma,
+                "normalize_channels": list(norm_channels),
+                "normalize_per_image": bool(norm_channels),
             }
         )
 
@@ -472,6 +517,10 @@ def build_h5_from_folder(
             except Exception as e:
                 print(f"[{i}/{len(pairs)}] SKIP {base_id}: preprocess error: {e}")
                 continue
+
+            if norm_channels:
+                normalize_channel_stack(raw2, norm_channels)
+                normalize_channel_stack(proc2, norm_channels)
 
             # raw2/proc2 are (2, H, W)
             _, h, w = raw2.shape
@@ -522,6 +571,7 @@ def build_h5_from_folder(
                     "clip_sigma": clip_sigma,
                     "patch": patch,
                     "stride": stride,
+                    "normalized_channels": list(norm_channels),
                 },
                 ensure_ascii=False,
             )
@@ -548,6 +598,14 @@ if __name__ == "__main__":
     p.add_argument("--topo_channel_title", type=str, default=None)
     p.add_argument("--aux_channel_title", type=str, default=None)
     p.add_argument("--max_pairs", type=int, default=None)
+    p.add_argument(
+        "--normalize_channels",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Channel indices to per-image normalize (default: 1). "
+        "Pass no values to disable normalization entirely.",
+    )
     args = p.parse_args()
 
     build_h5_from_folder(
@@ -560,4 +618,5 @@ if __name__ == "__main__":
         topo_channel_title=args.topo_channel_title,
         aux_channel_title=args.aux_channel_title,
         max_pairs=args.max_pairs,
+        normalize_channels=args.normalize_channels,
     )

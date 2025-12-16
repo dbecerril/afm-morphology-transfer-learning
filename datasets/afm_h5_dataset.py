@@ -115,8 +115,8 @@ class AFMPatchesH5Dataset(Dataset):
 
         if self.norm is not None:
             # broadcast (C,) -> (C,1,1)
-            mean = self.norm.mean[:, None, None]
-            std = self.norm.std[:, None, None].clamp_min(1e-6)[:, None, None]
+            mean = self.norm.mean.view(-1, 1, 1)
+            std = self.norm.std.clamp_min(1e-6).view(-1, 1, 1)
             x = (x - mean) / std
 
         if not self.return_meta:
