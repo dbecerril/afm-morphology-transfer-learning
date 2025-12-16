@@ -1,0 +1,15 @@
+{
+  "mode": "by-base-id",
+  "seed": 0,
+  "ratios": [
+    0.8,
+    0.1,
+    0.1
+  ],
+  "counts": {
+    "train": 166,
+    "val": 27,
+    "test": 9
+  },
+  "generated_by": "scripts/train_autoencoder.py"
+}

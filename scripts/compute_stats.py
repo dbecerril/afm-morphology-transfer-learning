@@ -16,6 +16,12 @@ def compute_channel_mean_std(
 
         if indices is None:
             indices = np.arange(N)
+        else:
+            indices = np.asarray(indices, dtype=np.int64)
+            # h5py fancy indexing expects monotonically increasing indices
+            if indices.ndim != 1:
+                indices = indices.reshape(-1)
+            indices = np.sort(indices)
 
         count = np.zeros((C,), dtype=np.int64)
         mean = np.zeros((C,), dtype=np.float64)

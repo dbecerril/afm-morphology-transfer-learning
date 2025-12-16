@@ -28,8 +28,8 @@ Main CLI options (see `--help`):
 - `--log-wandb`, `--wandb-project`, `--run-name`
 
 Notes:
-- If `--split-dir/{split_name}.npy` exists it will be used; otherwise the
-    whole dataset is used. Validation is run only if `--val-split` file exists.
+- Missing channel stats or split files are generated automatically (80/10/10
+    ratios, by-base-id when available) before training starts.
 - TensorBoard and W&B are optional; the script continues if those packages
     are not installed.
 """
@@ -49,14 +49,14 @@ Improvements vs your version:
 
 import argparse
 import json
-import os
 import random
 import shutil
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import sys
-from pathlib import Path
+
+import h5py
 
 # Ensure repo root is on PYTHONPATH (works on Colab + local)
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,12 +71,18 @@ from torch.utils.data import DataLoader
 from datasets.afm_h5_dataset import AFMPatchesH5Dataset, ChannelNorm
 from model.autoencoder_model import AFMUNetAutoencoder
 
+from compute_stats import compute_channel_mean_std
+from make_splits import by_base_id_split, random_split
+
+
+AUTO_SPLIT_RATIOS = (0.8, 0.1, 0.1)
+
 
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train AFM U-Net autoencoder")
-    p.add_argument("--h5", default="afm_patches_256_2ch.h5", help="HDF5 file with patches")
+    p.add_argument("--h5", default="afm_patches_256.h5", help="HDF5 file with patches")
     p.add_argument("--stats", default="stats/channel_norm.json", help="Channel norm JSON")
     p.add_argument("--split-dir", default="splits", help="Directory containing split .npy files")
     p.add_argument("--split-name", default="train", help="Which split to use (train/val/test)")
@@ -119,6 +125,100 @@ def parse_args():
     p.add_argument("--in-channels", type=int, default=2, help="Input channels expected by model")
 
     return p.parse_args()
+
+
+def ensure_split_files(args, ratios=AUTO_SPLIT_RATIOS):
+    split_dir = Path(args.split_dir)
+    train_path = split_dir / f"{args.split_name}.npy"
+    val_path = split_dir / f"{args.val_split}.npy" if args.val_split else None
+    needs_train = not train_path.exists()
+    needs_val = val_path is not None and not val_path.exists()
+    if not (needs_train or needs_val):
+        return {}
+
+    split_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        train_inds, val_inds, test_inds = by_base_id_split(args.h5, ratios, args.seed)
+        split_mode = "by-base-id"
+    except Exception as exc:
+        print(f"Auto split (by-base-id) unavailable ({exc}); falling back to random split.")
+        with h5py.File(args.h5, "r") as f:
+            total = int(f["patches/proc"].shape[0])
+        train_inds, val_inds, test_inds = random_split(total, ratios, args.seed)
+        split_mode = "random"
+
+    def save_unique(paths, arr, label):
+        seen = set()
+        for p in paths:
+            if p is None:
+                continue
+            path_obj = Path(p)
+            if path_obj in seen:
+                continue
+            np.save(path_obj, arr)
+            seen.add(path_obj)
+            print(f"Wrote {label} split ({len(arr)} samples) -> {path_obj}")
+
+    save_unique([split_dir / "train.npy", train_path], train_inds, "train")
+    val_targets = [split_dir / "val.npy"]
+    if val_path is not None:
+        val_targets.append(val_path)
+    save_unique(val_targets, val_inds, "val")
+    save_unique([split_dir / "test.npy"], test_inds, "test")
+
+    meta = {
+        "mode": split_mode,
+        "seed": args.seed,
+        "ratios": ratios,
+        "counts": {"train": int(len(train_inds)), "val": int(len(val_inds)), "test": int(len(test_inds))},
+        "generated_by": "scripts/train_autoencoder.py",
+    }
+    with open(split_dir / "metadata.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return {"train": train_inds, "val": val_inds, "test": test_inds}
+
+
+def ensure_channel_norm_file(args, preferred_train_indices=None):
+    stats_path = Path(args.stats)
+    if stats_path.exists():
+        return
+
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    train_indices = preferred_train_indices
+    if train_indices is None:
+        split_dir = Path(args.split_dir)
+        train_file = split_dir / f"{args.split_name}.npy"
+        if train_file.exists():
+            train_indices = np.load(train_file)
+
+    if train_indices is not None:
+        print(f"Stats file {stats_path} missing. Computing channel stats from {len(train_indices)} train samples.")
+    else:
+        print(f"Stats file {stats_path} missing. Computing channel stats from entire dataset.")
+
+    mean, std = compute_channel_mean_std(args.h5, indices=train_indices)
+    stats = {"mean": mean.tolist(), "std": std.tolist()}
+    stats_path.write_text(json.dumps(stats, indent=2))
+    print(f"Wrote channel norm stats -> {stats_path}")
+
+
+def resolve_h5_path(h5_path: str) -> Path:
+    candidate = Path(h5_path)
+    if candidate.exists():
+        return candidate
+
+    repo_candidate = REPO_ROOT / h5_path
+    if repo_candidate.exists():
+        return repo_candidate
+
+    datasets_candidate = REPO_ROOT / "datasets" / h5_path
+    if datasets_candidate.exists():
+        return datasets_candidate
+
+    raise FileNotFoundError(
+        f"HDF5 file '{h5_path}' not found. Pass --h5 with the correct dataset path (absolute or relative to repo)."
+    )
 
 
 def seed_everything(seed: int):
@@ -165,7 +265,11 @@ def save_recon_snapshot(model, device, batch, out_dir: Path, epoch: int, max_n: 
 
 def main():
     args = parse_args()
+    args.h5 = str(resolve_h5_path(args.h5))
     seed_everything(args.seed)
+
+    split_cache = ensure_split_files(args)
+    ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
 
     # run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
