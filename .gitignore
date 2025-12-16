@@ -23,3 +23,6 @@ Thumbs.db
 datasets/
 *.h5
 *.hdf5
+
+# Local AFM raw data (do not track)
+unet_grains/
