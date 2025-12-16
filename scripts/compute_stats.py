@@ -40,7 +40,7 @@ def compute_channel_mean_std(
 
 
 if __name__ == "__main__":
-    h5 = "afm_patches_256_2ch.h5"
+    h5 = "./datasets/afm_patches_256.h5"
 
     # example: random 80% train split
     with h5py.File(h5, "r") as f:

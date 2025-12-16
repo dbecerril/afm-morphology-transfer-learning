@@ -1,6 +1,10 @@
 """ 
 Process gwyddion files in a given folder
 does background substraction, row alignment, clips outliers and saves to .h5 file
+example run:
+python preprocess/process_gwy.py --input_dir data/data_gwy/ 
+--channel_title Topography 
+--stride 128 --out_h5 afm_patches_256.h5
 """
 from __future__ import annotations
 
