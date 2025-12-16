@@ -18,3 +18,8 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+#Large datasets / binaries
+datasets/
+*.h5
+*.hdf5
