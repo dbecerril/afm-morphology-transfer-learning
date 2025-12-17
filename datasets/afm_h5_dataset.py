@@ -49,6 +49,16 @@ class ChannelNorm:
     mean: torch.Tensor  # shape (C,)
     std: torch.Tensor   # shape (C,)
 
+    @staticmethod
+    def from_json(path: str | Path, *, device: str | torch.device = "cpu") -> "ChannelNorm":
+        """Load {'mean': [...], 'std': [...]} from preprocess channel_norm.json."""
+        import json
+
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        mean = torch.tensor(payload["mean"], dtype=torch.float32, device=device)
+        std = torch.tensor(payload["std"], dtype=torch.float32, device=device)
+        return ChannelNorm(mean=mean, std=std)
+
 
 class AFMPatchesH5Dataset(Dataset):
     """
@@ -64,7 +74,9 @@ class AFMPatchesH5Dataset(Dataset):
         self,
         h5_path: str | Path,
         *,
-        x_dataset: str = "patches/proc",
+        # Use "auto" to prefer patches/norm when present (created by preprocess),
+        # else fall back to patches/proc.
+        x_dataset: str = "auto",
         norm: Optional[ChannelNorm] = None,
         aux_types: Optional[Sequence[str]] = None,   # e.g. ["PHASE", "FRICTION"]
         indices: Optional[Sequence[int]] = None,     # explicit indices to use (subset)
@@ -79,6 +91,9 @@ class AFMPatchesH5Dataset(Dataset):
         # Build index list once (fast).
         # If `indices` is provided, use it (useful for train/val/test splits).
         with h5py.File(self.h5_path, "r") as f:
+            if self.x_dataset == "auto":
+                self.x_dataset = "patches/norm" if "patches/norm" in f else "patches/proc"
+
             x = f[self.x_dataset]
             self._shape = tuple(x.shape)  # (N,C,H,W)
 

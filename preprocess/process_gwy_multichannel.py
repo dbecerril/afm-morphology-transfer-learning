@@ -6,6 +6,13 @@ python preprocess/process_gwy_multichannel.py --input_dir data/data_gwy/ --topo_
 
 By default channel 1 (phase/friction) is normalized per image; use
 --normalize_channels to customize or disable that behavior.
+
+PATCH 2025-12:
+- Added `--topo_units {nm,um,m}` to scale ONLY channel 0 (topography) at preprocess time.
+- Added dataset-level channel normalization (mean/std over the whole patch dataset)
+  with optional creation of `patches/norm` (z-scored) and a `channel_norm.json` file.
+- Per-image normalization is still available for backwards-compat, but is OFF by default
+  (dataset-level normalization is the recommended path).
 """
 from __future__ import annotations
 
@@ -16,7 +23,80 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
+# Patch for old gwyfile + NumPy >= 2.0
+_old_fromstring = np.fromstring
+
+def _fromstring_compat(s, dtype=float, count=-1, sep=''):
+    # this is the case used by gwyfile: binary buffer, no sep
+    if isinstance(s, (bytes, bytearray)) and (sep == '' or sep is None):
+        return np.frombuffer(s, dtype=dtype, count=count)
+    # fallback to original behavior
+    return _old_fromstring(s, dtype=dtype, count=count, sep=sep)
+
+np.fromstring = _fromstring_compat
+
+
 import gwyfile
+
+
+# ---------- Running stats (dataset-level channel normalization) ----------
+
+class _RunningMeanVar:
+    """Welford running mean/variance over a stream of arrays."""
+
+    def __init__(self, c: int):
+        self.c = int(c)
+        self.n = np.zeros((c,), dtype=np.int64)
+        self.mean = np.zeros((c,), dtype=np.float64)
+        self.M2 = np.zeros((c,), dtype=np.float64)
+
+    def update(self, x: np.ndarray) -> None:
+        """x: (B,C,H,W) or (C,H,W) float array."""
+        if x.ndim == 3:
+            x = x[None, ...]
+        if x.ndim != 4:
+            raise ValueError(f"Expected x.ndim in {{3,4}}, got {x.ndim}")
+        b, c, h, w = x.shape
+        if c != self.c:
+            raise ValueError(f"Running stats expects C={self.c}, got {c}")
+
+        # Flatten per-channel
+        x2 = x.astype(np.float64, copy=False).reshape(b, c, h * w)
+        # Update channel by channel to keep it simple/robust.
+        for ch in range(c):
+            v = x2[:, ch, :].reshape(-1)
+            v = v[np.isfinite(v)]
+            if v.size == 0:
+                continue
+            for val in v:
+                self.n[ch] += 1
+                delta = val - self.mean[ch]
+                self.mean[ch] += delta / self.n[ch]
+                delta2 = val - self.mean[ch]
+                self.M2[ch] += delta * delta2
+
+    def finalize(self, std_eps: float = 1e-15) -> Tuple[np.ndarray, np.ndarray]:
+        var = np.zeros((self.c,), dtype=np.float64)
+        for ch in range(self.c):
+            if self.n[ch] > 1:
+                var[ch] = self.M2[ch] / (self.n[ch] - 1)
+
+        std = np.sqrt(np.maximum(var, 0.0))
+        std = np.maximum(std, std_eps)  # <-- floor std directly
+
+        return self.mean.astype(np.float32), std.astype(np.float32)
+
+
+
+def _topo_unit_scale(units: str) -> float:
+    u = units.strip().lower()
+    if u == "nm":
+        return 1e9
+    if u == "um" or u == "µm":
+        return 1e6
+    if u == "m":
+        return 1.0
+    raise ValueError(f"Unknown topo_units='{units}'. Use one of: nm, um, m")
 
 
 # ---------- Loading ----------
@@ -149,7 +229,7 @@ def robust_clip(z: np.ndarray, sigma: float = 8.0) -> np.ndarray:
 
     z = np.asarray(z, dtype=np.float32)
     med = np.median(z)
-    mad = np.median(np.abs(z - med)) + 1e-12
+    mad = np.median(np.abs(z - med)) + 1e-16
     robust_std = 1.4826 * mad
 
     lo = med - sigma * robust_std
@@ -200,7 +280,7 @@ def preprocess_pair_raw_and_proc(
 def normalize_channel_stack(
     stack: np.ndarray,
     channels: Sequence[int],
-    eps: float = 1e-6,
+    eps: float = 1e-16,
 ) -> None:
     """
     Normalize selected channels of a (C,H,W) stack in-place: (x - mean) / std.
@@ -350,10 +430,16 @@ def build_h5_from_folder(
     stride: int = 256,
     crop_border_frac: float = 0.05,
     clip_sigma: float | None = 8.0,
+    topo_units: str = "nm",
     topo_channel_title: Optional[str] = None,
     aux_channel_title: Optional[str] = None,
     max_pairs: int | None = None,
-    normalize_channels: Optional[Sequence[int]] = None,
+    # Back-compat only (NOT recommended): per-image normalization, e.g. (1,) to normalize aux per-image.
+    # Default OFF.
+    normalize_channels: Optional[Sequence[int]] = (),
+    # Recommended: dataset-level z-score normalization saved to patches/norm + channel_norm.json
+    write_norm_dataset: bool = True,
+    stats_out: Optional[Path] = None,
 ):
     """
     Finds topo+aux .gwy pairs in input_dir (based on filename suffix),
@@ -379,20 +465,27 @@ def build_h5_from_folder(
 
     out_h5.parent.mkdir(parents=True, exist_ok=True)
 
-    if normalize_channels is None:
-        norm_channels: Tuple[int, ...] = (1,)
-    else:
-        # remove duplicates but keep order
-        seen = []
+    # ---- Topography unit scaling ----
+    topo_scale = _topo_unit_scale(topo_units)
+
+    # ---- Per-image normalization (legacy) ----
+    # Normalize only if the user explicitly asked for it.
+    seen: List[int] = []
+    if normalize_channels:
         for ch in normalize_channels:
-            if ch not in seen:
+            if int(ch) not in seen:
                 seen.append(int(ch))
-        norm_channels = tuple(seen)
+    norm_channels: Tuple[int, ...] = tuple(seen)
 
     if norm_channels:
-        print(f"Per-image normalization enabled for channels: {norm_channels}")
+        print(f"[LEGACY] Per-image normalization enabled for channels: {norm_channels}")
     else:
-        print("Per-image normalization disabled.")
+        print("Per-image normalization disabled (recommended).")
+
+    if stats_out is None:
+        stats_out = out_h5.parent / "stats" / "channel_norm.json"
+    stats_out = Path(stats_out)
+    stats_out.parent.mkdir(parents=True, exist_ok=True)
 
     with h5py.File(out_h5, "w") as f:
         # Resizable datasets for patches (2 channels)
@@ -487,8 +580,14 @@ def build_h5_from_folder(
                 "clip_sigma": clip_sigma,
                 "normalize_channels": list(norm_channels),
                 "normalize_per_image": bool(norm_channels),
+                "topo_units": topo_units,
+                "topo_scale": topo_scale,
+                "write_norm_dataset": bool(write_norm_dataset),
             }
         )
+
+        # Running stats over the processed patches (dataset-level normalization)
+        run_stats = _RunningMeanVar(c=2)
 
         total_patches = 0
 
@@ -504,6 +603,11 @@ def build_h5_from_folder(
             except Exception as e:
                 print(f"[{i}/{len(pairs)}] SKIP {base_id}: load error: {e}")
                 continue
+
+            # Scale ONLY channel 0 (topography) into requested units.
+            topo_raw = topo_raw.astype(np.float32, copy=False) * float(topo_scale)
+            topo_meta["z_units"] = topo_units
+            topo_meta["z_scale_applied"] = float(topo_scale)
 
             try:
                 raw2, proc2 = preprocess_pair_raw_and_proc(
@@ -544,6 +648,9 @@ def build_h5_from_folder(
             append_to_resizable(d_proc, proc_patches)
             append_to_resizable(d_yx, yx)
 
+            # Update dataset-level stats from processed patches
+            run_stats.update(proc_patches)
+
             n = len(coords)
             # string datasets
             d_topo_file.resize((d_topo_file.shape[0] + n,))
@@ -581,6 +688,49 @@ def build_h5_from_folder(
             total_patches += n
             print(f"[{i}/{len(pairs)}] OK {base_id} ({aux_type}): {n} patches (total {total_patches})")
 
+        # ---- Finalize dataset-level normalization ----
+        mean, std = run_stats.finalize(std_eps=1e-15)
+
+        # Save in H5 attrs (convenient for downstream code)
+        f.attrs["channel_norm_mean"] = json.dumps([float(x) for x in mean.tolist()])
+        f.attrs["channel_norm_std"] = json.dumps([float(x) for x in std.tolist()])
+        f.attrs["channel_norm_dataset"] = "patches/proc"
+
+        # Save to JSON file (matches your training script's stats loading pattern)
+        stats_payload = {
+            "dataset": "patches/proc",
+            "channels": ["topography", "aux"],
+            "topo_units": topo_units,
+            "mean": [float(x) for x in mean.tolist()],
+            "std": [float(x) for x in std.tolist()],
+        }
+        stats_out.write_text(json.dumps(stats_payload, indent=2), encoding="utf-8")
+        print(f"Wrote channel stats to: {stats_out}")
+
+        # Optionally create a normalized dataset inside the H5 for training convenience.
+        if write_norm_dataset:
+            d_norm = f.create_dataset(
+                "patches/norm",
+                shape=d_proc.shape,
+                maxshape=d_proc.maxshape,
+                dtype="float32",
+                compression="gzip",
+                compression_opts=4,
+                chunks=d_proc.chunks,
+            )
+            m = mean.reshape(1, 2, 1, 1).astype(np.float32)
+            s = np.maximum(std, 1e-16).reshape(1, 2, 1, 1).astype(np.float32)
+
+            # Chunked copy/normalize
+            bs = 256
+            for start in range(0, d_proc.shape[0], bs):
+                end = min(start + bs, d_proc.shape[0])
+                x = d_proc[start:end]
+                d_norm[start:end] = (x - m) / s
+
+            f.attrs["channel_norm_dataset_normalized"] = "patches/norm"
+            print("Created normalized dataset: patches/norm")
+
         print(f"Done. Wrote {total_patches} paired patches to {out_h5}")
 
 
@@ -594,6 +744,13 @@ if __name__ == "__main__":
     p.add_argument("--stride", type=int, default=256)
     p.add_argument("--crop_border_frac", type=float, default=0.05)
     p.add_argument("--clip_sigma", type=float, default=8.0)
+    p.add_argument(
+        "--topo_units",
+        type=str,
+        default="nm",
+        choices=["nm", "um", "m"],
+        help="Scale ONLY channel 0 (topography) to these units at preprocess time. Default: nm.",
+    )
     # Optional: if your .gwy contains multiple channels and you want a specific one
     p.add_argument("--topo_channel_title", type=str, default=None)
     p.add_argument("--aux_channel_title", type=str, default=None)
@@ -602,9 +759,25 @@ if __name__ == "__main__":
         "--normalize_channels",
         type=int,
         nargs="*",
+        default=(),
+        help="[LEGACY] Channel indices to per-image normalize. Default: disabled. "
+        "(Recommended: use dataset-level normalization via patches/norm + channel_norm.json.)",
+    )
+    p.add_argument(
+        "--stats_out",
+        type=str,
         default=None,
-        help="Channel indices to per-image normalize (default: 1). "
-        "Pass no values to disable normalization entirely.",
+        help="Where to write channel_norm.json (default: <out_h5_dir>/stats/channel_norm.json)",
+    )
+    p.add_argument(
+        "--write_norm_dataset",
+        action="store_true",
+        help="Create patches/norm inside the H5 (z-scored using dataset stats).",
+    )
+    p.add_argument(
+        "--no_write_norm_dataset",
+        action="store_true",
+        help="Do NOT create patches/norm (only write stats + patches/proc).",
     )
     args = p.parse_args()
 
@@ -615,8 +788,11 @@ if __name__ == "__main__":
         stride=args.stride,
         crop_border_frac=args.crop_border_frac,
         clip_sigma=args.clip_sigma,
+        topo_units=args.topo_units,
         topo_channel_title=args.topo_channel_title,
         aux_channel_title=args.aux_channel_title,
         max_pairs=args.max_pairs,
         normalize_channels=args.normalize_channels,
+        stats_out=Path(args.stats_out) if args.stats_out else None,
+        write_norm_dataset=(False if args.no_write_norm_dataset else (True if args.write_norm_dataset else True)),
     )
