@@ -32,6 +32,14 @@ Notes:
     ratios, by-base-id when available) before training starts.
 - TensorBoard and W&B are optional; the script continues if those packages
     are not installed.
+How to run:
+    python scripts/train_autoencoder.py \
+  --h5 /content/afm_patches.h5 \
+  --in-channels 2 \
+  --out-channels 1 \
+  --target-channel 0 \
+  --log-tb
+
 """
 #!/usr/bin/env python3
 """
@@ -124,14 +132,9 @@ def parse_args():
     p.add_argument("--aux-types", nargs="+", default=["PHASE", "FRICTION"], help="Aux channels to use")
     p.add_argument("--in-channels", type=int, default=2, help="Input channels expected by model")
 
-    # loss weighting (channel-wise)
-    p.add_argument(
-        "--loss-weights",
-        type=float,
-        nargs="+",
-        default=[3.0, 1.0],
-        help="Per-channel weights for reconstruction loss (e.g. --loss-weights 3 1). Default: 3 1 (topo, aux).",
-    )
+    # Option A: input includes aux channel(s), but we only reconstruct topography (channel 0 by default)
+    p.add_argument("--out-channels", type=int, default=1, help="Number of output channels to reconstruct. For Option A use 1 (topo only).")
+    p.add_argument("--target-channel", type=int, default=0, help="Which input channel to reconstruct when out-channels=1 (0=topo).")
 
     return p.parse_args()
 
@@ -230,15 +233,6 @@ def resolve_h5_path(h5_path: str) -> Path:
     )
 
 
-
-def h5_has_dataset(h5_path: str, dset: str) -> bool:
-    try:
-        with h5py.File(h5_path, "r") as f:
-            return dset in f
-    except Exception:
-        return False
-
-
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -257,23 +251,10 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
-def weighted_channel_mse(out: torch.Tensor, x: torch.Tensor, weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute per-channel MSE over (B,C,H,W) and return:
-      total_weighted_loss (scalar), per_channel_loss (C,)
-    weights: (C,) on same device/dtype as x/out.
-    """
-    diff2 = (out - x) ** 2  # (B,C,H,W)
-    per_ch = diff2.mean(dim=(0, 2, 3))  # (C,)
-    total = (per_ch * weights).sum()
-    return total, per_ch
-
-
-
 @torch.no_grad()
 def save_recon_snapshot(model, device, batch, out_dir: Path, epoch: int, max_n: int = 8):
     """
-    Saves a simple numpy snapshot: input, recon, residual for first channel (and second if present).
+    Saves a simple numpy snapshot: input, recon, residual for topography (channel 0).
     This avoids extra deps; you can visualize later or add matplotlib if you like.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -283,7 +264,7 @@ def save_recon_snapshot(model, device, batch, out_dir: Path, epoch: int, max_n: 
     # Move to CPU
     x_np = x.detach().cpu().float().numpy()
     y_np = y.detach().cpu().float().numpy()
-    r_np = np.abs(x_np - y_np)
+    r_np = np.abs(x_np[:, 0:1] - y_np)  # residual on topo only
 
     # Save as npz (easy to load/plot later)
     np.savez_compressed(
@@ -300,16 +281,7 @@ def main():
     seed_everything(args.seed)
 
     split_cache = ensure_split_files(args)
-
-    # Prefer using pre-normalized patches if they exist (recommended).
-    # If `patches/norm` is present, we train directly on it and skip ChannelNorm.
-    use_norm_dataset = h5_has_dataset(args.h5, "patches/norm")
-    x_dataset = "patches/norm" if use_norm_dataset else "patches/proc"
-
-    if not use_norm_dataset:
-        ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
-    else:
-        print("Found HDF5 dataset 'patches/norm' -> using it (skipping ChannelNorm stats).")
+    ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
 
     # run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -321,20 +293,18 @@ def main():
 
     # store run config and stats copy for reproducibility
     (ckpt_dir / "run_config.json").write_text(json.dumps(vars(args), indent=2))
-    if not use_norm_dataset:
-        try:
-            shutil.copy(args.stats, ckpt_dir / "channel_norm.json")
-        except Exception:
-            pass
-    # Normalization: if training on `patches/norm`, data is already standardized.
-    norm = None
-    if not use_norm_dataset:
-        with open(args.stats) as f:
-            stats = json.load(f)
-        norm = ChannelNorm(
-            mean=torch.tensor(stats["mean"], dtype=torch.float32),
-            std=torch.tensor(stats["std"], dtype=torch.float32),
-        )
+    try:
+        shutil.copy(args.stats, ckpt_dir / "channel_norm.json")
+    except Exception:
+        pass
+
+    # load stats
+    with open(args.stats) as f:
+        stats = json.load(f)
+    norm = ChannelNorm(
+        mean=torch.tensor(stats["mean"], dtype=torch.float32),
+        std=torch.tensor(stats["std"], dtype=torch.float32),
+    )
 
     # splits
     split_dir = Path(args.split_dir)
@@ -346,7 +316,7 @@ def main():
         indices = None
         print(f"No split file {indices_path}, using entire dataset")
 
-    train_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=indices, x_dataset=x_dataset)
+    train_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=indices)
 
     # DataLoader perf knobs (Colab)
     pin_memory = torch.cuda.is_available()
@@ -372,7 +342,7 @@ def main():
     val_path = split_dir / f"{args.val_split}.npy"
     if val_path.exists():
         val_inds = np.load(val_path)
-        val_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=val_inds, x_dataset=x_dataset)
+        val_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=val_inds)
         val_loader = DataLoader(
             val_ds,
             batch_size=args.batch_size * 2,
@@ -390,13 +360,13 @@ def main():
         print(f"No validation split found at {val_path} (training only)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AFMUNetAutoencoder(in_channels=args.in_channels).to(device)
+    model = AFMUNetAutoencoder(in_channels=args.in_channels, out_channels=args.out_channels).to(device)
+
+    if args.out_channels == 1 and args.target_channel >= args.in_channels:
+        raise ValueError(f"--target-channel must be < --in-channels (got {args.target_channel} vs {args.in_channels})")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    loss_w = torch.tensor(args.loss_weights, dtype=torch.float32, device=device)
-    if loss_w.numel() != args.in_channels:
-        raise ValueError(f"--loss-weights expects {args.in_channels} values (got {loss_w.numel()})")
+    criterion = torch.nn.MSELoss(reduction="mean")
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.use_amp and device.type == "cuda"))
 
@@ -471,7 +441,6 @@ def main():
 
             train_loss_sum = 0.0
             train_n = 0
-            train_ch_sum = None  # tensor(C,) accumulated with sample-weighting
 
             for batch_idx, x in enumerate(train_loader, start=1):
                 if not first_batch_checked:
@@ -485,7 +454,8 @@ def main():
 
                 with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                     out = model(x)
-                    loss, per_ch = weighted_channel_mse(out, x, loss_w)
+                    target = x[:, args.target_channel:args.target_channel+1]
+                    loss = criterion(out, target)
 
                 scaler.scale(loss).backward()
 
@@ -499,10 +469,6 @@ def main():
                 # sample-weighted accumulation
                 train_loss_sum += loss.detach().item() * bs
                 train_n += bs
-                if train_ch_sum is None:
-                    train_ch_sum = per_ch.detach() * bs
-                else:
-                    train_ch_sum += per_ch.detach() * bs
                 global_step += 1
 
                 if batch_idx % args.log_interval == 0:
@@ -512,27 +478,17 @@ def main():
                     print(msg)
                     if tb_writer is not None:
                         tb_writer.add_scalar("train/batch_loss", loss.item(), global_step)
-                        for c in range(per_ch.numel()):
-                            tb_writer.add_scalar(f"train/batch_mse_ch{c}", per_ch[c].item(), global_step)
                         tb_writer.add_scalar("train/lr", lr_now, global_step)
                     if wandb_run is not None:
                         wandb_run.log({"train/batch_loss": loss.item(), "train/lr": lr_now, "global_step": global_step})
-                        ch_logs = {f"train/batch_mse_ch{c}": per_ch[c].item() for c in range(per_ch.numel())}
-                        wandb_run.log({**ch_logs, "global_step": global_step})
 
             epoch_train_loss = train_loss_sum / max(1, train_n)
-            epoch_train_ch = (train_ch_sum / max(1, train_n)) if train_ch_sum is not None else None
             print(f"Epoch {epoch} completed. Train loss: {epoch_train_loss:.6f}")
 
             if tb_writer is not None:
                 tb_writer.add_scalar("train/epoch_loss", epoch_train_loss, epoch)
-                if epoch_train_ch is not None:
-                    for c in range(epoch_train_ch.numel()):
-                        tb_writer.add_scalar(f"train/epoch_mse_ch{c}", epoch_train_ch[c].item(), epoch)
             if wandb_run is not None:
                 wandb_run.log({"train/epoch_loss": epoch_train_loss, "epoch": epoch})
-                if epoch_train_ch is not None:
-                    wandb_run.log({**{f"train/epoch_mse_ch{c}": epoch_train_ch[c].item() for c in range(epoch_train_ch.numel())}, "epoch": epoch})
 
             # validation
             val_loss = None
@@ -540,7 +496,6 @@ def main():
                 model.eval()
                 val_loss_sum = 0.0
                 val_n = 0
-                val_ch_sum = None
 
                 with torch.no_grad():
                     for xb in val_loader:
@@ -548,27 +503,18 @@ def main():
                         bs = xb.size(0)
                         with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                             outb = model(xb)
-                        lb, per_chb = weighted_channel_mse(outb, xb, loss_w)
+                            targetb = xb[:, args.target_channel:args.target_channel+1]
+                        lb = criterion(outb, targetb)
                         val_loss_sum += lb.item() * bs
                         val_n += bs
-                        if val_ch_sum is None:
-                            val_ch_sum = per_chb.detach() * bs
-                        else:
-                            val_ch_sum += per_chb.detach() * bs
 
                 val_loss = val_loss_sum / max(1, val_n)
-                val_ch = (val_ch_sum / max(1, val_n)) if val_ch_sum is not None else None
                 print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
 
                 if tb_writer is not None:
                     tb_writer.add_scalar("val/epoch_loss", val_loss, epoch)
-                    if val_ch is not None:
-                        for c in range(val_ch.numel()):
-                            tb_writer.add_scalar(f"val/epoch_mse_ch{c}", val_ch[c].item(), epoch)
                 if wandb_run is not None:
                     wandb_run.log({"val/epoch_loss": val_loss, "epoch": epoch})
-                    if val_ch is not None:
-                        wandb_run.log({**{f"val/epoch_mse_ch{c}": val_ch[c].item() for c in range(val_ch.numel())}, "epoch": epoch})
 
             # scheduler step
             if scheduler is not None:

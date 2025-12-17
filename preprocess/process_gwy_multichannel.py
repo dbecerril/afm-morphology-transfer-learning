@@ -264,10 +264,10 @@ def preprocess_pair_raw_and_proc(
     # Process each channel independently (often best: phase/friction shouldn't share topo plane)
     if do_plane:
         topo_p = subtract_best_fit_plane(topo_p)
-        aux_p = subtract_best_fit_plane(aux_p)
+        #aux_p = subtract_best_fit_plane(aux_p)
     if do_row_median:
         topo_p = align_rows_by_median(topo_p)
-        aux_p = align_rows_by_median(aux_p)
+        #aux_p = align_rows_by_median(aux_p)
     if clip_sigma is not None:
         topo_p = robust_clip(topo_p, sigma=float(clip_sigma))
         aux_p = robust_clip(aux_p, sigma=float(clip_sigma))
