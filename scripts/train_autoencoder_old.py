@@ -221,6 +221,15 @@ def resolve_h5_path(h5_path: str) -> Path:
     )
 
 
+
+def h5_has_dataset(h5_path: str, dset: str) -> bool:
+    try:
+        with h5py.File(h5_path, "r") as f:
+            return dset in f
+    except Exception:
+        return False
+
+
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -269,7 +278,16 @@ def main():
     seed_everything(args.seed)
 
     split_cache = ensure_split_files(args)
-    ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
+
+    # Prefer using pre-normalized patches if they exist (recommended).
+    # If `patches/norm` is present, we train directly on it and skip ChannelNorm.
+    use_norm_dataset = h5_has_dataset(args.h5, "patches/norm")
+    x_dataset = "patches/norm" if use_norm_dataset else "patches/proc"
+
+    if not use_norm_dataset:
+        ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
+    else:
+        print("Found HDF5 dataset 'patches/norm' -> using it (skipping ChannelNorm stats).")
 
     # run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -281,18 +299,20 @@ def main():
 
     # store run config and stats copy for reproducibility
     (ckpt_dir / "run_config.json").write_text(json.dumps(vars(args), indent=2))
-    try:
-        shutil.copy(args.stats, ckpt_dir / "channel_norm.json")
-    except Exception:
-        pass
-
-    # load stats
-    with open(args.stats) as f:
-        stats = json.load(f)
-    norm = ChannelNorm(
-        mean=torch.tensor(stats["mean"], dtype=torch.float32),
-        std=torch.tensor(stats["std"], dtype=torch.float32),
-    )
+    if not use_norm_dataset:
+        try:
+            shutil.copy(args.stats, ckpt_dir / "channel_norm.json")
+        except Exception:
+            pass
+    # Normalization: if training on `patches/norm`, data is already standardized.
+    norm = None
+    if not use_norm_dataset:
+        with open(args.stats) as f:
+            stats = json.load(f)
+        norm = ChannelNorm(
+            mean=torch.tensor(stats["mean"], dtype=torch.float32),
+            std=torch.tensor(stats["std"], dtype=torch.float32),
+        )
 
     # splits
     split_dir = Path(args.split_dir)
@@ -304,7 +324,7 @@ def main():
         indices = None
         print(f"No split file {indices_path}, using entire dataset")
 
-    train_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=indices)
+    train_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=indices, x_dataset=x_dataset)
 
     # DataLoader perf knobs (Colab)
     pin_memory = torch.cuda.is_available()
@@ -330,7 +350,7 @@ def main():
     val_path = split_dir / f"{args.val_split}.npy"
     if val_path.exists():
         val_inds = np.load(val_path)
-        val_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=val_inds)
+        val_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=val_inds, x_dataset=x_dataset)
         val_loader = DataLoader(
             val_ds,
             batch_size=args.batch_size * 2,

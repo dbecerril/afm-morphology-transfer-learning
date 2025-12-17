@@ -124,6 +124,15 @@ def parse_args():
     p.add_argument("--aux-types", nargs="+", default=["PHASE", "FRICTION"], help="Aux channels to use")
     p.add_argument("--in-channels", type=int, default=2, help="Input channels expected by model")
 
+    # loss weighting (channel-wise)
+    p.add_argument(
+        "--loss-weights",
+        type=float,
+        nargs="+",
+        default=[3.0, 1.0],
+        help="Per-channel weights for reconstruction loss (e.g. --loss-weights 3 1). Default: 3 1 (topo, aux).",
+    )
+
     return p.parse_args()
 
 
@@ -246,6 +255,19 @@ def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def weighted_channel_mse(out: torch.Tensor, x: torch.Tensor, weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute per-channel MSE over (B,C,H,W) and return:
+      total_weighted_loss (scalar), per_channel_loss (C,)
+    weights: (C,) on same device/dtype as x/out.
+    """
+    diff2 = (out - x) ** 2  # (B,C,H,W)
+    per_ch = diff2.mean(dim=(0, 2, 3))  # (C,)
+    total = (per_ch * weights).sum()
+    return total, per_ch
+
 
 
 @torch.no_grad()
@@ -371,7 +393,10 @@ def main():
     model = AFMUNetAutoencoder(in_channels=args.in_channels).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = torch.nn.MSELoss(reduction="mean")
+
+    loss_w = torch.tensor(args.loss_weights, dtype=torch.float32, device=device)
+    if loss_w.numel() != args.in_channels:
+        raise ValueError(f"--loss-weights expects {args.in_channels} values (got {loss_w.numel()})")
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.use_amp and device.type == "cuda"))
 
@@ -446,6 +471,7 @@ def main():
 
             train_loss_sum = 0.0
             train_n = 0
+            train_ch_sum = None  # tensor(C,) accumulated with sample-weighting
 
             for batch_idx, x in enumerate(train_loader, start=1):
                 if not first_batch_checked:
@@ -459,7 +485,7 @@ def main():
 
                 with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                     out = model(x)
-                    loss = criterion(out, x)
+                    loss, per_ch = weighted_channel_mse(out, x, loss_w)
 
                 scaler.scale(loss).backward()
 
@@ -473,6 +499,10 @@ def main():
                 # sample-weighted accumulation
                 train_loss_sum += loss.detach().item() * bs
                 train_n += bs
+                if train_ch_sum is None:
+                    train_ch_sum = per_ch.detach() * bs
+                else:
+                    train_ch_sum += per_ch.detach() * bs
                 global_step += 1
 
                 if batch_idx % args.log_interval == 0:
@@ -482,17 +512,27 @@ def main():
                     print(msg)
                     if tb_writer is not None:
                         tb_writer.add_scalar("train/batch_loss", loss.item(), global_step)
+                        for c in range(per_ch.numel()):
+                            tb_writer.add_scalar(f"train/batch_mse_ch{c}", per_ch[c].item(), global_step)
                         tb_writer.add_scalar("train/lr", lr_now, global_step)
                     if wandb_run is not None:
                         wandb_run.log({"train/batch_loss": loss.item(), "train/lr": lr_now, "global_step": global_step})
+                        ch_logs = {f"train/batch_mse_ch{c}": per_ch[c].item() for c in range(per_ch.numel())}
+                        wandb_run.log({**ch_logs, "global_step": global_step})
 
             epoch_train_loss = train_loss_sum / max(1, train_n)
+            epoch_train_ch = (train_ch_sum / max(1, train_n)) if train_ch_sum is not None else None
             print(f"Epoch {epoch} completed. Train loss: {epoch_train_loss:.6f}")
 
             if tb_writer is not None:
                 tb_writer.add_scalar("train/epoch_loss", epoch_train_loss, epoch)
+                if epoch_train_ch is not None:
+                    for c in range(epoch_train_ch.numel()):
+                        tb_writer.add_scalar(f"train/epoch_mse_ch{c}", epoch_train_ch[c].item(), epoch)
             if wandb_run is not None:
                 wandb_run.log({"train/epoch_loss": epoch_train_loss, "epoch": epoch})
+                if epoch_train_ch is not None:
+                    wandb_run.log({**{f"train/epoch_mse_ch{c}": epoch_train_ch[c].item() for c in range(epoch_train_ch.numel())}, "epoch": epoch})
 
             # validation
             val_loss = None
@@ -500,6 +540,7 @@ def main():
                 model.eval()
                 val_loss_sum = 0.0
                 val_n = 0
+                val_ch_sum = None
 
                 with torch.no_grad():
                     for xb in val_loader:
@@ -507,17 +548,27 @@ def main():
                         bs = xb.size(0)
                         with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                             outb = model(xb)
-                            lb = criterion(outb, xb)
+                        lb, per_chb = weighted_channel_mse(outb, xb, loss_w)
                         val_loss_sum += lb.item() * bs
                         val_n += bs
+                        if val_ch_sum is None:
+                            val_ch_sum = per_chb.detach() * bs
+                        else:
+                            val_ch_sum += per_chb.detach() * bs
 
                 val_loss = val_loss_sum / max(1, val_n)
+                val_ch = (val_ch_sum / max(1, val_n)) if val_ch_sum is not None else None
                 print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
 
                 if tb_writer is not None:
                     tb_writer.add_scalar("val/epoch_loss", val_loss, epoch)
+                    if val_ch is not None:
+                        for c in range(val_ch.numel()):
+                            tb_writer.add_scalar(f"val/epoch_mse_ch{c}", val_ch[c].item(), epoch)
                 if wandb_run is not None:
                     wandb_run.log({"val/epoch_loss": val_loss, "epoch": epoch})
+                    if val_ch is not None:
+                        wandb_run.log({**{f"val/epoch_mse_ch{c}": val_ch[c].item() for c in range(val_ch.numel())}, "epoch": epoch})
 
             # scheduler step
             if scheduler is not None:
