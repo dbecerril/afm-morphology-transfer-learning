@@ -83,13 +83,8 @@ from model.autoencoder_model import AFMUNetAutoencoder
 from utils.reproducibility import seed_everything
 from utils.io import resolve_h5_path, ensure_split_files, ensure_channel_norm_file
 from utils.data import load_channel_norm, build_dataloaders
-from utils.logging import (
-    setup_tensorboard,
-    setup_wandb,
-    log_train_step,
-    log_epoch,
-    close_loggers,
-)
+from utils.logging import setup_tensorboard,setup_wandb,log_train_step,log_epoch,close_loggers
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train AFM U-Net autoencoder")
     p.add_argument("--h5", default="afm_patches_256.h5", help="HDF5 file with patches")
@@ -123,6 +118,7 @@ def parse_args():
     p.add_argument("--scheduler", action="store_true", help="Enable ReduceLROnPlateau scheduler (uses val if present)")
     p.add_argument("--patience", type=int, default=5, help="Scheduler patience")
     p.add_argument("--min-lr", type=float, default=1e-6, help="Scheduler min lr")
+
 
     # snapshotting
     p.add_argument("--save-snapshots", action="store_true", help="Save recon snapshots every N epochs")
@@ -170,7 +166,7 @@ def save_recon_snapshot(model, device, batch, out_dir: Path, epoch: int, max_n: 
 
 def main():
     args = parse_args()
-    args.h5 = str(resolve_h5_path(args.h5))
+    args.h5 = str(resolve_h5_path(args.h5, REPO_ROOT))
     seed_everything(args.seed)
 
     split_cache = ensure_split_files(args)
@@ -178,7 +174,12 @@ def main():
     
     norm = load_channel_norm(args.stats)
     train_loader, val_loader, train_ds, val_ds = build_dataloaders(args, norm,use_aux=args.use_aux_conditioning)
-    
+    # ---- Infer actual channel counts from data (robust) ----
+    x0 = next(iter(train_loader))            # CPU batch is fine
+    n_ch = x0.size(1)
+    aux_ch = max(0, n_ch - 1)
+    print(f"[Sanity] Detected channels from dataset: total={n_ch}, aux={aux_ch}")
+
     # run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"ae_{timestamp}"
@@ -202,17 +203,16 @@ def main():
         vars(args),
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    aux_ch = len(args.aux_types)  # e.g. 2 for PHASE+FRICTION
 
     model = AFMUNetAutoencoder(
         in_channels=1,                       # topo-only encoder input
-        out_channels=args.out_channels,       # should be 1 for topo recon
+        out_channels=1,       # should be 1 for topo recon
         aux_channels=(aux_ch if args.use_aux_conditioning else 0),
         aux_dropout=args.aux_dropout,
     ).to(device)
 
-    if args.out_channels == 1 and args.target_channel >= args.in_channels:
-        raise ValueError(f"--target-channel must be < --in-channels (got {args.target_channel} vs {args.in_channels})")
+    #if args.out_channels == 1 and args.target_channel >= args.in_channels:
+    #    raise ValueError(f"--target-channel must be < --in-channels (got {args.target_channel} vs {args.in_channels})")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = torch.nn.MSELoss(reduction="mean")
