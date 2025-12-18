@@ -132,6 +132,11 @@ def parse_args():
         default=[3.0, 1.0],
         help="Per-channel weights for reconstruction loss (e.g. --loss-weights 3 1). Default: 3 1 (topo, aux).",
     )
+# FiLM
+    p.add_argument("--use-aux-conditioning", action="store_true",
+                help="Use aux as late FiLM conditioning in decoder (topo is still the only encoder input).")
+    p.add_argument("--aux-dropout", type=float, default=0.3,
+                help="Probability of zeroing aux during training (prevents aux from dominating).")
 
     return p.parse_args()
 

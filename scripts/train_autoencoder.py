@@ -79,14 +79,10 @@ from torch.utils.data import DataLoader
 from datasets.afm_h5_dataset import AFMPatchesH5Dataset, ChannelNorm
 from model.autoencoder_model import AFMUNetAutoencoder
 
-from compute_stats import compute_channel_mean_std
-from make_splits import by_base_id_split, random_split
 
-
-AUTO_SPLIT_RATIOS = (0.8, 0.1, 0.1)
-
-
-
+from utils.reproducibility import seed_everything
+from utils.io import resolve_h5_path, ensure_split_files, ensure_channel_norm_file
+from utils.data import load_channel_norm, build_dataloaders
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train AFM U-Net autoencoder")
@@ -138,119 +134,6 @@ def parse_args():
 
     return p.parse_args()
 
-
-def ensure_split_files(args, ratios=AUTO_SPLIT_RATIOS):
-    split_dir = Path(args.split_dir)
-    train_path = split_dir / f"{args.split_name}.npy"
-    val_path = split_dir / f"{args.val_split}.npy" if args.val_split else None
-    needs_train = not train_path.exists()
-    needs_val = val_path is not None and not val_path.exists()
-    if not (needs_train or needs_val):
-        return {}
-
-    split_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        train_inds, val_inds, test_inds = by_base_id_split(args.h5, ratios, args.seed)
-        split_mode = "by-base-id"
-    except Exception as exc:
-        print(f"Auto split (by-base-id) unavailable ({exc}); falling back to random split.")
-        with h5py.File(args.h5, "r") as f:
-            total = int(f["patches/proc"].shape[0])
-        train_inds, val_inds, test_inds = random_split(total, ratios, args.seed)
-        split_mode = "random"
-
-    def save_unique(paths, arr, label):
-        seen = set()
-        for p in paths:
-            if p is None:
-                continue
-            path_obj = Path(p)
-            if path_obj in seen:
-                continue
-            np.save(path_obj, arr)
-            seen.add(path_obj)
-            print(f"Wrote {label} split ({len(arr)} samples) -> {path_obj}")
-
-    save_unique([split_dir / "train.npy", train_path], train_inds, "train")
-    val_targets = [split_dir / "val.npy"]
-    if val_path is not None:
-        val_targets.append(val_path)
-    save_unique(val_targets, val_inds, "val")
-    save_unique([split_dir / "test.npy"], test_inds, "test")
-
-    meta = {
-        "mode": split_mode,
-        "seed": args.seed,
-        "ratios": ratios,
-        "counts": {"train": int(len(train_inds)), "val": int(len(val_inds)), "test": int(len(test_inds))},
-        "generated_by": "scripts/train_autoencoder.py",
-    }
-    with open(split_dir / "metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    return {"train": train_inds, "val": val_inds, "test": test_inds}
-
-
-def ensure_channel_norm_file(args, preferred_train_indices=None):
-    stats_path = Path(args.stats)
-    if stats_path.exists():
-        return
-
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    train_indices = preferred_train_indices
-    if train_indices is None:
-        split_dir = Path(args.split_dir)
-        train_file = split_dir / f"{args.split_name}.npy"
-        if train_file.exists():
-            train_indices = np.load(train_file)
-
-    if train_indices is not None:
-        print(f"Stats file {stats_path} missing. Computing channel stats from {len(train_indices)} train samples.")
-    else:
-        print(f"Stats file {stats_path} missing. Computing channel stats from entire dataset.")
-
-    mean, std = compute_channel_mean_std(args.h5, indices=train_indices)
-    stats = {"mean": mean.tolist(), "std": std.tolist()}
-    stats_path.write_text(json.dumps(stats, indent=2))
-    print(f"Wrote channel norm stats -> {stats_path}")
-
-
-def resolve_h5_path(h5_path: str) -> Path:
-    candidate = Path(h5_path)
-    if candidate.exists():
-        return candidate
-
-    repo_candidate = REPO_ROOT / h5_path
-    if repo_candidate.exists():
-        return repo_candidate
-
-    datasets_candidate = REPO_ROOT / "datasets" / h5_path
-    if datasets_candidate.exists():
-        return datasets_candidate
-
-    raise FileNotFoundError(
-        f"HDF5 file '{h5_path}' not found. Pass --h5 with the correct dataset path (absolute or relative to repo)."
-    )
-
-
-def seed_everything(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # Reproducibility settings (slower but stable)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def seed_worker(worker_id: int):
-    # Make DataLoader workers deterministic
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 @torch.no_grad()
 def save_recon_snapshot(model, device, batch, out_dir: Path, epoch: int, max_n: int = 8):
     """
@@ -282,7 +165,10 @@ def main():
 
     split_cache = ensure_split_files(args)
     ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
-
+    
+    norm = load_channel_norm(args.stats)
+    train_loader, val_loader, train_ds, val_ds = build_dataloaders(args, norm)
+    
     # run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"ae_{timestamp}"
@@ -298,66 +184,6 @@ def main():
     except Exception:
         pass
 
-    # load stats
-    with open(args.stats) as f:
-        stats = json.load(f)
-    norm = ChannelNorm(
-        mean=torch.tensor(stats["mean"], dtype=torch.float32),
-        std=torch.tensor(stats["std"], dtype=torch.float32),
-    )
-
-    # splits
-    split_dir = Path(args.split_dir)
-    indices_path = split_dir / f"{args.split_name}.npy"
-    if indices_path.exists():
-        indices = np.load(indices_path)
-        print(f"Using indices from {indices_path} (count={len(indices)})")
-    else:
-        indices = None
-        print(f"No split file {indices_path}, using entire dataset")
-
-    train_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=indices)
-
-    # DataLoader perf knobs (Colab)
-    pin_memory = torch.cuda.is_available()
-    persistent_workers = args.num_workers > 0
-    g = torch.Generator()
-    g.manual_seed(args.seed)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        worker_init_fn=seed_worker if args.num_workers > 0 else None,
-        generator=g,
-        prefetch_factor=2 if args.num_workers > 0 else None,
-        drop_last=False,
-    )
-
-    # optional validation
-    val_loader = None
-    val_path = split_dir / f"{args.val_split}.npy"
-    if val_path.exists():
-        val_inds = np.load(val_path)
-        val_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=val_inds)
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size * 2,
-            shuffle=False,
-            num_workers=max(1, args.num_workers // 2),
-            pin_memory=pin_memory,
-            persistent_workers=(args.num_workers // 2) > 0,
-            worker_init_fn=seed_worker if (args.num_workers // 2) > 0 else None,
-            generator=g,
-            prefetch_factor=2 if (args.num_workers // 2) > 0 else None,
-            drop_last=False,
-        )
-        print(f"Validation split loaded from {val_path} (count={len(val_inds)})")
-    else:
-        print(f"No validation split found at {val_path} (training only)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AFMUNetAutoencoder(in_channels=args.in_channels, out_channels=args.out_channels).to(device)
