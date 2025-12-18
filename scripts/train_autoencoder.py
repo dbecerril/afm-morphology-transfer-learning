@@ -83,7 +83,13 @@ from model.autoencoder_model import AFMUNetAutoencoder
 from utils.reproducibility import seed_everything
 from utils.io import resolve_h5_path, ensure_split_files, ensure_channel_norm_file
 from utils.data import load_channel_norm, build_dataloaders
-
+from utils.logging import (
+    setup_tensorboard,
+    setup_wandb,
+    log_train_step,
+    log_epoch,
+    close_loggers,
+)
 def parse_args():
     p = argparse.ArgumentParser(description="Train AFM U-Net autoencoder")
     p.add_argument("--h5", default="afm_patches_256.h5", help="HDF5 file with patches")
@@ -126,11 +132,12 @@ def parse_args():
 
     # dataset channels (keep your default; adjust if you change dataset)
     p.add_argument("--aux-types", nargs="+", default=["PHASE", "FRICTION"], help="Aux channels to use")
-    p.add_argument("--in-channels", type=int, default=2, help="Input channels expected by model")
 
-    # Option A: input includes aux channel(s), but we only reconstruct topography (channel 0 by default)
-    p.add_argument("--out-channels", type=int, default=1, help="Number of output channels to reconstruct. For Option A use 1 (topo only).")
-    p.add_argument("--target-channel", type=int, default=0, help="Which input channel to reconstruct when out-channels=1 (0=topo).")
+    #FLI options
+    p.add_argument("--use-aux-conditioning", action="store_true",
+                help="Use aux as late FiLM conditioning (topo-only encoder input).")
+    p.add_argument("--aux-dropout", type=float, default=0.3,
+                help="Probability of dropping aux during training.")
 
     return p.parse_args()
 
@@ -142,7 +149,10 @@ def save_recon_snapshot(model, device, batch, out_dir: Path, epoch: int, max_n: 
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     x = batch[:max_n].to(device, non_blocking=True)
-    y = model(x)
+    topo = x[:, :1]
+    aux  = x[:, 1:] if x.size(1) > 1 else None
+    y = model(topo, aux) if (aux is not None and model.aux_channels > 0) else model(topo)
+
 
     # Move to CPU
     x_np = x.detach().cpu().float().numpy()
@@ -167,7 +177,7 @@ def main():
     ensure_channel_norm_file(args, preferred_train_indices=split_cache.get("train"))
     
     norm = load_channel_norm(args.stats)
-    train_loader, val_loader, train_ds, val_ds = build_dataloaders(args, norm)
+    train_loader, val_loader, train_ds, val_ds = build_dataloaders(args, norm,use_aux=args.use_aux_conditioning)
     
     # run name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -184,9 +194,22 @@ def main():
     except Exception:
         pass
 
-
+    tb_writer = setup_tensorboard(args.log_dir, run_name) if args.log_tb else None
+    wandb_run = setup_wandb(
+        args.log_wandb,
+        args.wandb_project,
+        run_name,
+        vars(args),
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AFMUNetAutoencoder(in_channels=args.in_channels, out_channels=args.out_channels).to(device)
+    aux_ch = len(args.aux_types)  # e.g. 2 for PHASE+FRICTION
+
+    model = AFMUNetAutoencoder(
+        in_channels=1,                       # topo-only encoder input
+        out_channels=args.out_channels,       # should be 1 for topo recon
+        aux_channels=(aux_ch if args.use_aux_conditioning else 0),
+        aux_dropout=args.aux_dropout,
+    ).to(device)
 
     if args.out_channels == 1 and args.target_channel >= args.in_channels:
         raise ValueError(f"--target-channel must be < --in-channels (got {args.target_channel} vs {args.in_channels})")
@@ -206,30 +229,6 @@ def main():
             min_lr=args.min_lr,
             verbose=True,
         )
-
-    # logging setup
-    tb_writer = None
-    if args.log_tb:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-
-            tb_log_dir = Path(args.log_dir) / run_name
-            tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
-            print(f"TensorBoard logging enabled at {tb_log_dir}")
-        except Exception as e:
-            tb_writer = None
-            print(f"TensorBoard not available: {e}")
-
-    wandb_run = None
-    if args.log_wandb:
-        try:
-            import wandb
-
-            wandb_run = wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
-            print(f"Weights & Biases logging enabled (project={args.wandb_project})")
-        except Exception as e:
-            wandb_run = None
-            print(f"wandb not available or failed to init: {e}")
 
     # resume support
     start_epoch = 1
@@ -256,7 +255,7 @@ def main():
             print(f"Resume checkpoint {resume_path} not found, starting from scratch")
 
     print(f"Training on device: {device}, dataset size: {len(train_ds)} patches")
-    print(f"Model expects in_channels={args.in_channels}; dataset aux_types={args.aux_types}")
+    print(f"Model in_channels=1 (topo-only); aux_conditioning={args.use_aux_conditioning}; aux_types={args.aux_types}")
 
     # quick sanity check on the first batch shape
     first_batch_checked = False
@@ -277,11 +276,15 @@ def main():
                 bs = x.size(0)
 
                 optimizer.zero_grad(set_to_none=True)
+                topo = x[:, :1]
+                aux = x[:, 1:] if x.size(1) > 1 else None
 
                 with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                    out = model(x)
-                    target = x[:, args.target_channel:args.target_channel+1]
-                    loss = criterion(out, target)
+                    if args.use_aux_conditioning:
+                        out = model(topo, aux)
+                    else:
+                        out = model(topo)
+                    loss = criterion(out, topo)
 
                 scaler.scale(loss).backward()
 
@@ -298,23 +301,17 @@ def main():
                 global_step += 1
 
                 if batch_idx % args.log_interval == 0:
-                    avg = train_loss_sum / max(1, train_n)
-                    lr_now = optimizer.param_groups[0]["lr"]
-                    msg = f"Epoch {epoch} | Batch {batch_idx}/{len(train_loader)} | Train avg loss: {avg:.6f} | LR: {lr_now:.2e}"
-                    print(msg)
-                    if tb_writer is not None:
-                        tb_writer.add_scalar("train/batch_loss", loss.item(), global_step)
-                        tb_writer.add_scalar("train/lr", lr_now, global_step)
-                    if wandb_run is not None:
-                        wandb_run.log({"train/batch_loss": loss.item(), "train/lr": lr_now, "global_step": global_step})
+                    log_train_step(
+                        tb_writer,
+                        wandb_run,
+                        loss.item(),
+                        optimizer.param_groups[0]["lr"],
+                        global_step,
+                    )
 
             epoch_train_loss = train_loss_sum / max(1, train_n)
+            log_epoch(tb_writer, wandb_run, "train", epoch_train_loss, epoch)
             print(f"Epoch {epoch} completed. Train loss: {epoch_train_loss:.6f}")
-
-            if tb_writer is not None:
-                tb_writer.add_scalar("train/epoch_loss", epoch_train_loss, epoch)
-            if wandb_run is not None:
-                wandb_run.log({"train/epoch_loss": epoch_train_loss, "epoch": epoch})
 
             # validation
             val_loss = None
@@ -327,20 +324,18 @@ def main():
                     for xb in val_loader:
                         xb = xb.to(device, non_blocking=True)
                         bs = xb.size(0)
+                        topob = xb[:, :1]
+                        auxb  = xb[:, 1:] if xb.size(1) > 1 else None
                         with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                            outb = model(xb)
-                            targetb = xb[:, args.target_channel:args.target_channel+1]
-                        lb = criterion(outb, targetb)
+                            outb = model(topob, auxb) if args.use_aux_conditioning else model(topob)
+                        lb = criterion(outb, topob)
                         val_loss_sum += lb.item() * bs
                         val_n += bs
 
                 val_loss = val_loss_sum / max(1, val_n)
                 print(f"Epoch {epoch} validation loss: {val_loss:.6f}")
+                log_epoch(tb_writer, wandb_run, "val", val_loss, epoch)
 
-                if tb_writer is not None:
-                    tb_writer.add_scalar("val/epoch_loss", val_loss, epoch)
-                if wandb_run is not None:
-                    wandb_run.log({"val/epoch_loss": val_loss, "epoch": epoch})
 
             # scheduler step
             if scheduler is not None:
@@ -390,6 +385,7 @@ def main():
                     print(f"Saved snapshot npz to: {snap_dir / f'epoch_{epoch:03d}.npz'}")
                 except Exception as e:
                     print(f"Snapshot save failed: {e}")
+        
 
     except KeyboardInterrupt:
         print("Training interrupted by user, saving last checkpoint...")
@@ -406,15 +402,7 @@ def main():
         )
         print(f"Saved: {ckpt_path}")
     finally:
-        if tb_writer is not None:
-            tb_writer.close()
-        if wandb_run is not None:
-            try:
-                import wandb
-
-                wandb.finish()
-            except Exception:
-                pass
+        close_loggers(tb_writer, wandb_run)
 
 
 if __name__ == "__main__":

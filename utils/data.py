@@ -15,15 +15,19 @@ def load_channel_norm(stats_path: str) -> ChannelNorm:
         std=torch.tensor(stats["std"], dtype=torch.float32),
     )
 
-def build_dataloaders(args, norm: ChannelNorm):
+def build_dataloaders(args, norm: ChannelNorm,use_aux: bool = True):
     split_dir = Path(args.split_dir)
 
     # train indices
     indices_path = split_dir / f"{args.split_name}.npy"
     train_inds = np.load(indices_path) if indices_path.exists() else None
-
-    train_ds = AFMPatchesH5Dataset(args.h5, norm=norm, aux_types=args.aux_types, indices=train_inds)
-
+    aux_types = args.aux_types if use_aux else []
+    train_ds = AFMPatchesH5Dataset(
+        args.h5,
+        norm=norm,
+        aux_types=aux_types,
+        indices=train_inds
+    )
     pin_memory = torch.cuda.is_available()
     persistent_workers = args.num_workers > 0
     g = torch.Generator()
