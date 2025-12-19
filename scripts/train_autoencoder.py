@@ -82,7 +82,7 @@ from model.autoencoder_model import AFMUNetAutoencoder
 
 from utils.reproducibility import seed_everything
 from utils.io import resolve_h5_path, ensure_split_files, ensure_channel_norm_file
-from utils.data import load_channel_norm, build_dataloaders
+from utils.data import load_channel_norm, build_dataloaders,sobel_grad_mag_1ch
 from utils.logging import setup_tensorboard,setup_wandb,log_train_step,log_epoch,close_loggers
 
 def parse_args():
@@ -134,6 +134,8 @@ def parse_args():
                 help="Use aux as late FiLM conditioning (topo-only encoder input).")
     p.add_argument("--aux-dropout", type=float, default=0.3,
                 help="Probability of dropping aux during training.")
+    p.add_argument("--grad-loss", type=float, default=0.0,
+                help="Weight for gradient (Sobel) loss on topo reconstruction.")
 
     return p.parse_args()
 
@@ -284,8 +286,19 @@ def main():
                         out = model(topo, aux)
                     else:
                         out = model(topo)
-                    loss = F.l1_loss(out[:, :,margin:-margin, margin:-margin], topo[:,:,margin:-margin,margin:-margin]) #criterion(out, topo)
+                    out_c  = out[:, :, margin:-margin, margin:-margin]
+                    topo_c = topo[:, :, margin:-margin, margin:-margin]
 
+                    loss_l1 = F.l1_loss(out_c, topo_c)
+
+                    if args.grad_loss > 0:
+                        go = sobel_grad_mag_1ch(out_c)
+                        gt = sobel_grad_mag_1ch(topo_c)
+                        loss_g = F.l1_loss(go, gt)
+                        loss = loss_l1 + args.grad_loss * loss_g
+                    else:
+                        loss = loss_l1
+                        
                 scaler.scale(loss).backward()
 
                 if args.grad_clip and args.grad_clip > 0:
@@ -328,7 +341,18 @@ def main():
                         auxb  = xb[:, 1:] if xb.size(1) > 1 else None
                         with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                             outb = model(topob, auxb) if args.use_aux_conditioning else model(topob)
-                        lb = F.l1_loss(outb[:, :,margin:-margin, margin:-margin], topob[:,:,margin:-margin,margin:-margin] ) #criterion(outb, topob)
+                        out_c  = out[:, :, margin:-margin, margin:-margin]
+                    topo_c = topo[:, :, margin:-margin, margin:-margin]
+
+                    loss_l1 = F.l1_loss(out_c, topo_c)
+
+                    if args.grad_loss > 0:
+                        go = sobel_grad_mag_1ch(out_c)
+                        gt = sobel_grad_mag_1ch(topo_c)
+                        loss_g = F.l1_loss(go, gt)
+                        lb = loss_l1 + args.grad_loss * loss_g
+                    else:
+                        lb = loss_l1 #criterion(outb, topob)
                         val_loss_sum += lb.item() * bs
                         val_n += bs
 
