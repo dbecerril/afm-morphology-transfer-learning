@@ -1,5 +1,5 @@
 {
-  "h5": "datasets\\afm_patches_256.h5",
+  "h5": "/content/afm-morphology-transfer-learning/datasets/afm_patches_256.h5",
   "stats": "stats/channel_norm.json",
   "split_dir": "splits",
   "split_name": "train",
@@ -17,8 +17,8 @@
   "log_interval": 100,
   "log_wandb": false,
   "wandb_project": "afm-autoencoder",
-  "run_name": null,
-  "use_amp": true,
+  "run_name": "topo_only",
+  "use_amp": false,
   "grad_clip": 0.0,
   "scheduler": false,
   "patience": 5,
@@ -31,9 +31,6 @@
     "PHASE",
     "FRICTION"
   ],
-  "in_channels": 2,
-  "loss_weights": [
-    3.0,
-    1.0
-  ]
+  "use_aux_conditioning": false,
+  "aux_dropout": 0.3
 }

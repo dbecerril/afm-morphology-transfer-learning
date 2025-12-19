@@ -75,7 +75,7 @@ if str(REPO_ROOT) not in sys.path:
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-
+import torch.nn.functional as F 
 from datasets.afm_h5_dataset import AFMPatchesH5Dataset, ChannelNorm
 from model.autoencoder_model import AFMUNetAutoencoder
 
@@ -259,7 +259,7 @@ def main():
 
     # quick sanity check on the first batch shape
     first_batch_checked = False
-
+    margin = 16  # crop margin for loss computation
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             model.train()
@@ -284,7 +284,7 @@ def main():
                         out = model(topo, aux)
                     else:
                         out = model(topo)
-                    loss = criterion(out, topo)
+                    loss = F.l1_loss(out[:, :,margin:-margin, margin:-margin], topo[:,:,margin:-margin,margin:-margin]) #criterion(out, topo)
 
                 scaler.scale(loss).backward()
 

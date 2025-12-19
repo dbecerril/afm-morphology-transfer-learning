@@ -38,10 +38,10 @@ class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, groups: int = 8):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, padding_mode="reflect"),
             gn(out_ch, groups),
             nn.SiLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, padding_mode="reflect"),
             gn(out_ch, groups),
             nn.SiLU(inplace=True),
         )
@@ -53,7 +53,7 @@ class ConvBlock(nn.Module):
 class Down(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, groups: int = 8):
         super().__init__()
-        self.pool = nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=2, padding=1)  # strided conv
+        self.pool = nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=2, padding=1, padding_mode="reflect")  # strided conv
         self.block = ConvBlock(in_ch, out_ch, groups)
 
     def forward(self, x):
@@ -93,7 +93,7 @@ class AFMUNetAutoencoder(nn.Module):
         self.enc3 = Down(base * 4, base * 8, groups)            # 32x32
 
         # bottleneck at 16x16
-        self.bottleneck_down = nn.Conv2d(base * 8, base * 8, 3, stride=2, padding=1)
+        self.bottleneck_down = nn.Conv2d(base * 8, base * 8, 3, stride=2, padding=1, padding_mode="reflect")
         self.bottleneck = ConvBlock(base * 8, base * 8, groups)
 
         # decoder
@@ -172,3 +172,14 @@ class AFMUNetAutoencoder(nn.Module):
         b = self.bottleneck(b)
         # global average pool: (B, C, H, W) -> (B, C)
         return b.mean(dim=(-2, -1))
+
+    @torch.no_grad()
+    def embed_map(self, x):
+        xtopo = x[:, 0:1]
+        s0 = self.enc0(xtopo)
+        s1 = self.enc1(s0)
+        s2 = self.enc2(s1)
+        s3 = self.enc3(s2)
+        b = self.bottleneck_down(s3)
+        b = self.bottleneck(b)
+        return b  # (B,C,h,w) e.g. (B,256,16,16)
