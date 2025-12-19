@@ -93,12 +93,17 @@ class AFMUNetAutoencoder(nn.Module):
         self.enc3 = Down(base * 4, base * 8, groups)            # 32x32
 
         # bottleneck at 16x16
-        self.bottleneck_down = nn.Conv2d(base * 8, base * 8, 3, stride=2, padding=1, padding_mode="reflect")
+        #self.bottleneck_down = nn.Conv2d(base * 8, base * 8, 3, stride=2, padding=1, padding_mode="reflect")
+        #self.bottleneck = ConvBlock(base * 8, base * 8, groups)
         self.bottleneck = ConvBlock(base * 8, base * 8, groups)
 
         # decoder
-        self.up3 = Up(base * 8, base * 8, base * 4, groups)     # 32x32
-        self.up2 = Up(base * 4, base * 4, base * 2, groups)     # 64x64
+        #self.up3 = Up(base * 8, base * 8, base * 4, groups)     # 32x32
+        #self.up2 = Up(base * 4, base * 4, base * 2, groups)     # 64x64
+        # decoder
+        self.dec3 = ConvBlock(base * 8 + base * 8, base * 4, groups)  # merge b + s3 at 32x32
+        self.up2  = Up(base * 4, base * 4, base * 2, groups)         # 64x64
+
         self.up1 = Up(base * 2, base * 2, base, groups)         # 128x128
 
         self.up0 = nn.Upsample(scale_factor=2, mode="nearest")  # 256x256
@@ -111,7 +116,7 @@ class AFMUNetAutoencoder(nn.Module):
 
         if aux_channels > 0:
             # late conditioning: start conservative (decoder only)
-            self.film_up3 = FiLM(aux_channels, base * 4)  # output of up3
+            #self.film_up3 = FiLM(aux_channels, base * 4)  # output of up3
             self.film_up2 = FiLM(aux_channels, base * 2)  # output of up2
             self.film_up1 = FiLM(aux_channels, base)      # output of up1
             self.film_dec0 = FiLM(aux_channels, base)     # output of dec0
@@ -123,9 +128,9 @@ class AFMUNetAutoencoder(nn.Module):
         s2 = self.enc2(s1)
         s3 = self.enc3(s2)
 
-        b = self.bottleneck_down(s3)
-        b = self.bottleneck(b)
-
+        #b = self.bottleneck_down(s3)
+        #b = self.bottleneck(b)
+        b = self.bottleneck(s3)
         # Optional aux conditioning (late)
         if self.aux_channels > 0:
             if aux is None:
@@ -136,9 +141,8 @@ class AFMUNetAutoencoder(nn.Module):
                 if torch.rand((), device=aux.device) < self.aux_dropout:
                     aux = torch.zeros_like(aux)
 
-        x = self.up3(b, s3)
-        if self.aux_channels > 0:
-            x = self.film_up3(x, aux)
+        x = torch.cat([b, s3], dim=1)   # both 32x32
+        x = self.dec3(x) 
 
         x = self.up2(x, s2)
         if self.aux_channels > 0:
@@ -168,8 +172,9 @@ class AFMUNetAutoencoder(nn.Module):
         s1 = self.enc1(s0)
         s2 = self.enc2(s1)
         s3 = self.enc3(s2)
-        b = self.bottleneck_down(s3)
-        b = self.bottleneck(b)
+        #b = self.bottleneck_down(s3)
+        #b = self.bottleneck(b)
+        b = self.bottleneck(s3)
         # global average pool: (B, C, H, W) -> (B, C)
         return b.mean(dim=(-2, -1))
 
@@ -180,6 +185,7 @@ class AFMUNetAutoencoder(nn.Module):
         s1 = self.enc1(s0)
         s2 = self.enc2(s1)
         s3 = self.enc3(s2)
-        b = self.bottleneck_down(s3)
-        b = self.bottleneck(b)
-        return b  # (B,C,h,w) e.g. (B,256,16,16)
+        #b = self.bottleneck_down(s3)
+        #b = self.bottleneck(b)
+        b = self.bottleneck(s3)
+        return b  # (B,C,h,w) e.g. (B,256,32,32)
