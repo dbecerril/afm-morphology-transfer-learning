@@ -328,7 +328,7 @@ def main():
                         auxb  = xb[:, 1:] if xb.size(1) > 1 else None
                         with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                             outb = model(topob, auxb) if args.use_aux_conditioning else model(topob)
-                        lb = criterion(outb, topob)
+                        lb = F.l1_loss(outb[:, :,margin:-margin, margin:-margin], topob[:,:,margin:-margin,margin:-margin] ) #criterion(outb, topob)
                         val_loss_sum += lb.item() * bs
                         val_n += bs
 
