@@ -82,7 +82,8 @@ from model.autoencoder_model import AFMUNetAutoencoder
 
 from utils.reproducibility import seed_everything
 from utils.io import resolve_h5_path, ensure_split_files, ensure_channel_norm_file
-from utils.data import load_channel_norm, build_dataloaders,sobel_grad_mag_1ch
+from utils.data import load_channel_norm, build_dataloaders
+from utils.compute_stats import sobel_grad_mag_1ch
 from utils.logging import setup_tensorboard,setup_wandb,log_train_step,log_epoch,close_loggers
 
 def parse_args():
