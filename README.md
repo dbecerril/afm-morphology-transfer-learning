@@ -33,15 +33,6 @@ Key design choices:
 
 ---
 
-## What the Project Demonstrates
-
-- Use of autoencoders for **unsupervised feature extraction**
-- Handling of real experimental AFM data (noise, artifacts, variability)
-- Exploration of latent representations across correlated signals
-- Comparison between geometric (topography) and functional channels
-- Practical deep learning workflows in Python (PyTorch)
-
----
 
 ## Project Structure
 
