@@ -2,8 +2,7 @@
 
 This repository contains an **unsupervised deep learning pipeline** based on convolutional autoencoders, developed to analyze **multichannel AFM data** and explore shared and hidden representations across correlated physical signals.
 
-The project focuses on **representation learning**, not classification accuracy, and was built on real experimental AFM datasets.
-
+The project focuses on **representation learning**, not classification accuracy, and was built on real experimental AFM datasets. In particular of thin film perovskites and diverse metal oxide films. 
 ---
 
 ## Motivation
